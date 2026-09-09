@@ -2,7 +2,7 @@ class GitCwt < Formula
   desc "Remove the git worktrees whose branch has already been merged"
   homepage "https://github.com/baptiste-pasquier/homebrew-tap"
   url "https://github.com/baptiste-pasquier/homebrew-tap/archive/refs/tags/git-cwt-1.0.0.tar.gz"
-  sha256 "PLACEHOLDER"
+  sha256 "ae13cf7721288a577efa881dc17e13ab36adfb503d199626d529091bb1fe32ee"
   license "MIT"
 
   # Squash-merged branches are only recognised through the GitHub API.
