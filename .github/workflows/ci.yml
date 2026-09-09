@@ -16,7 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - run: bin/git-cwt --help | grep -q 'usage: git cwt'
+      - run: |
+          bin/git-cwt --help | grep -q 'usage: git cwt'
       - run: bin/git-cwt --version
       - name: fails outside a repository
         run: |
