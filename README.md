@@ -15,8 +15,9 @@ $ git cwt                 # dry run
 base origin/develop   gh: on (squash merges detected)
 
 would remove .worktrees/fix-login-redirect          (merged into develop)
-would remove .worktrees/pr-57                       (PR #57 merged)
+would remove .worktrees/pr-57                       (PR #57 merged, including 2 ignored paths)
         skip .worktrees/spike-caching               uncommitted changes
+        skip .worktrees/rework-cache                PR #61 merged, local commits are not
         skip .worktrees/release-notes               locked
 
 2 to remove, 0 stale. Re-run with -y to apply.
@@ -29,11 +30,19 @@ $ git cwt -y              # apply
 Two criteria, either one is enough:
 
 1. The branch is contained in the base branch (`origin/HEAD`, or `-b <base>`).
-2. `gh` reports a **merged pull request** for it. This is what catches
+2. `gh` reports a **pull request merged into that same base branch**, and the
+   branch tip is the commit that pull request merged. This is what catches
    squash-merged branches: squashing rewrites the commits, so such a branch is
    never an ancestor of the base and criterion 1 alone would miss it. Worktrees
    whose branch is named `worktree-pr-<n>` are resolved by PR number instead of
    by head branch.
+
+   Both halves of criterion 2 matter. Without the base check, a branch merged
+   into another line — a stacked PR, a release branch — would be dropped while
+   you are cleaning against `main`. Without the tip check, commits made on top
+   of a merged PR would be destroyed by the branch deletion below, since they
+   never reached the base; such a worktree is reported as `PR #<n> merged,
+   local commits are not`.
 
 Without an authenticated `gh`, the header says `gh: off` and only criterion 1
 applies — expect squash-merged branches to be reported as `not merged`.
@@ -41,8 +50,13 @@ applies — expect squash-merged branches to be reported as `not merged`.
 ### What is never touched
 
 The main worktree, the worktree you are standing in, locked worktrees, detached
-HEADs, and any worktree holding uncommitted changes. A worktree whose directory
-was deleted by hand is reported as stale and cleared with `git worktree prune`.
+HEADs, and any worktree holding uncommitted changes or commits that never made
+it into the base. A worktree whose directory was deleted by hand is reported as
+stale and cleared with `git worktree prune`.
+
+Ignored files (a `.env`, an installed `node_modules`) do not hold a worktree
+back — `git worktree remove` deletes them along with the rest — but they are
+counted in the report line, as `including 2 ignored paths`.
 
 Branch deletion uses `git branch -d`, falling back to `-D` when git refuses.
 That fallback is deliberate: `-d` measures merge status against your current

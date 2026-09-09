@@ -2,15 +2,17 @@
 # git-cwt — remove git worktrees whose branch has already been merged.
 #
 # A worktree is a deletion candidate when its branch is contained in the base
-# branch, or when `gh` reports a merged pull request for it (which is how
-# squash-merged branches are recognised — they are never ancestors of the base).
+# branch, or when `gh` reports a pull request merged into that same base branch
+# whose merged tip is the branch tip (which is how squash-merged branches are
+# recognised — they are never ancestors of the base).
 #
 # Never touched: the main worktree, the worktree you are standing in, locked
-# worktrees, detached HEADs, and anything holding uncommitted changes.
+# worktrees, detached HEADs, anything holding uncommitted changes, and any
+# branch carrying commits that never reached the base.
 
 set -uo pipefail
 
-VERSION=1.0.0
+VERSION=1.0.1
 
 usage() {
   cat <<'USAGE'
@@ -79,29 +81,50 @@ if [ -z "$base" ]; then
   printf '%s: cannot determine a base branch; pass -b <base>\n' "${0##*/}" >&2
   exit 1
 fi
+# An unresolvable base would silently disable the containment criterion: every
+# `git merge-base --is-ancestor` below would just fail and every worktree would
+# be reported as `not merged`.
+if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+  printf '%s: base %s does not resolve to a commit\n' "${0##*/}" "$base" >&2
+  exit 1
+fi
+base_branch=${base#refs/remotes/}
+base_branch=${base_branch#refs/heads/}
+base_branch=${base_branch#origin/}
 
 have_gh=0
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   have_gh=1
 fi
 
-# merged_pr <branch> — prints the number of a merged PR for the branch, if any.
+# merged_pr <branch> — looks for a pull request from <branch> merged into the
+# base branch. Sets pr_number and pr_head_oid and returns 0 when there is one.
+pr_number="" pr_head_oid=""
 merged_pr() {
-  local branch=$1 number
-  [ "$have_gh" -eq 1 ] || return 0
+  local branch=$1 number fields state pr_base
+  pr_number="" pr_head_oid=""
+  [ "$have_gh" -eq 1 ] || return 1
   # Worktrees created straight from a PR carry a synthetic branch name, so the
   # PR is addressed by number rather than by head branch.
   if [[ $branch =~ ^worktree-pr-([0-9]+)$ ]]; then
     number=${BASH_REMATCH[1]}
-    if [ "$(gh pr view "$number" --json state -q .state 2>/dev/null)" = MERGED ]; then
-      printf '%s' "$number"
+    fields=$(gh pr view "$number" --json state,baseRefName,headRefOid \
+      -q '[.state, .baseRefName, .headRefOid] | @tsv' 2>/dev/null)
+    IFS=$'\t' read -r state pr_base pr_head_oid <<<"$fields"
+    if [ "$state" = MERGED ] && [ "$pr_base" = "$base_branch" ]; then
+      pr_number=$number
+      return 0
     fi
-    return 0
+    pr_head_oid=""
+    return 1
   fi
-  number=$(gh pr list --head "$branch" --state merged --limit 1 \
-    --json number -q '.[0].number' 2>/dev/null)
-  [ -n "$number" ] && printf '%s' "$number"
-  return 0
+  # --base matters: without it a branch merged into another line — a stacked PR,
+  # a release branch — is reported as merged into the base we compare against.
+  fields=$(gh pr list --head "$branch" --base "$base_branch" --state merged \
+    --limit 1 --json number,headRefOid \
+    -q '.[0] | [.number, .headRefOid] | @tsv' 2>/dev/null)
+  IFS=$'\t' read -r pr_number pr_head_oid <<<"$fields"
+  [ -n "$pr_number" ]
 }
 
 declare -a wt_path=() wt_branch=() wt_flags=()
@@ -168,15 +191,33 @@ for i in "${!wt_path[@]}"; do
   fi
 
   if git merge-base --is-ancestor "refs/heads/$branch" "$base" 2>/dev/null; then
-    why="merged into ${base#origin/}"
-  else
-    pr=$(merged_pr "$branch")
-    if [ -n "$pr" ]; then
-      why="PR #$pr merged"
-    else
-      report "$c_dim" skip "$rel" "not merged"
+    why="merged into $base_branch"
+  elif merged_pr "$branch"; then
+    # A squash merge rewrites the commits, so the branch tip is never contained
+    # in the base: what makes the worktree safe to drop is the tip being the
+    # very commit the pull request merged. Anything committed on top of it never
+    # reached the base, and the `git branch -D` below would destroy the only
+    # copy — a merged PR alone is not enough of a guarantee.
+    tip=$(git rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null)
+    if [ "$tip" != "$pr_head_oid" ] &&
+      ! git merge-base --is-ancestor "$tip" "$pr_head_oid" 2>/dev/null; then
+      report "$c_dim" skip "$rel" "PR #$pr_number merged, local commits are not"
       continue
     fi
+    why="PR #$pr_number merged"
+  else
+    report "$c_dim" skip "$rel" "not merged"
+    continue
+  fi
+
+  # Ignored files are invisible to the guard above, and `git worktree remove`
+  # deletes them along with the rest — a .env or an installed node_modules is
+  # worth naming before it goes.
+  ignored=$(git -C "$path" status --porcelain --ignored 2>/dev/null | grep -c '^!! ' || true)
+  if [ "$ignored" -eq 1 ]; then
+    why="$why, including 1 ignored path"
+  elif [ "$ignored" -gt 1 ]; then
+    why="$why, including $ignored ignored paths"
   fi
 
   if [ "$dry_run" -eq 1 ]; then
