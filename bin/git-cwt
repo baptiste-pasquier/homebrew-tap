@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# git-cwt — remove git worktrees whose branch has already been merged.
+#
+# A worktree is a deletion candidate when its branch is contained in the base
+# branch, or when `gh` reports a merged pull request for it (which is how
+# squash-merged branches are recognised — they are never ancestors of the base).
+#
+# Never touched: the main worktree, the worktree you are standing in, locked
+# worktrees, detached HEADs, and anything holding uncommitted changes.
+
+set -uo pipefail
+
+VERSION=1.0.0
+
+usage() {
+  cat <<'USAGE'
+usage: git cwt [-n | -y] [--no-fetch] [-b <base>]
+
+  -n, --dry-run   list what would be removed (default)
+  -y, --yes       remove the worktrees and delete their branches
+      --no-fetch  skip the initial `git fetch --prune`
+  -b, --base      base branch to compare against (default: origin/HEAD)
+  -v, --version   print the version
+  -h, --help      print this help
+USAGE
+}
+
+dry_run=1 fetch=1 base=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -y|--yes) dry_run=0 ;;
+    -n|--dry-run) dry_run=1 ;;
+    --no-fetch) fetch=0 ;;
+    -b|--base)
+      if [ $# -lt 2 ]; then
+        printf '%s: --base needs an argument\n' "${0##*/}" >&2
+        exit 2
+      fi
+      base=$2
+      shift
+      ;;
+    -v|--version) printf 'git-cwt %s\n' "$VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf '%s: unknown option: %s\n' "${0##*/}" "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  printf '%s: not a git repository\n' "${0##*/}" >&2
+  exit 1
+fi
+
+if [ -t 1 ]; then
+  c_dim=$'\033[2m' c_ok=$'\033[32m' c_warn=$'\033[33m' c_off=$'\033[0m'
+else
+  c_dim="" c_ok="" c_warn="" c_off=""
+fi
+
+# report <colour> <status> <path> <note>
+report() {
+  printf '%s%12s%s %-58s %s%s%s\n' "$1" "$2" "$c_off" "$3" "$c_dim" "$4" "$c_off"
+}
+
+[ "$fetch" -eq 1 ] && git fetch --prune --quiet 2>/dev/null
+
+if [ -z "$base" ]; then
+  base=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's#^refs/remotes/##')
+fi
+if [ -z "$base" ]; then
+  for candidate in origin/develop origin/main origin/master; do
+    if git rev-parse --verify --quiet "$candidate" >/dev/null; then
+      base=$candidate
+      break
+    fi
+  done
+fi
+if [ -z "$base" ]; then
+  printf '%s: cannot determine a base branch; pass -b <base>\n' "${0##*/}" >&2
+  exit 1
+fi
+
+have_gh=0
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  have_gh=1
+fi
+
+# merged_pr <branch> — prints the number of a merged PR for the branch, if any.
+merged_pr() {
+  local branch=$1 number
+  [ "$have_gh" -eq 1 ] || return 0
+  # Worktrees created straight from a PR carry a synthetic branch name, so the
+  # PR is addressed by number rather than by head branch.
+  if [[ $branch =~ ^worktree-pr-([0-9]+)$ ]]; then
+    number=${BASH_REMATCH[1]}
+    if [ "$(gh pr view "$number" --json state -q .state 2>/dev/null)" = MERGED ]; then
+      printf '%s' "$number"
+    fi
+    return 0
+  fi
+  number=$(gh pr list --head "$branch" --state merged --limit 1 \
+    --json number -q '.[0].number' 2>/dev/null)
+  [ -n "$number" ] && printf '%s' "$number"
+  return 0
+}
+
+declare -a wt_path=() wt_branch=() wt_flags=()
+path="" branch="" flags=""
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*) path=${line#worktree }; branch=""; flags="" ;;
+    "branch "*) branch=${line#branch }; branch=${branch#refs/heads/} ;;
+    locked*) flags="$flags locked" ;;
+    prunable*) flags="$flags prunable" ;;
+    bare) flags="$flags bare" ;;
+    detached) flags="$flags detached" ;;
+    "")
+      if [ -n "$path" ]; then
+        wt_path+=("$path")
+        wt_branch+=("$branch")
+        wt_flags+=("$flags")
+        path=""
+      fi
+      ;;
+  esac
+done < <(git worktree list --porcelain; printf '\n')
+
+main=${wt_path[0]:-}
+current=$(git rev-parse --show-toplevel 2>/dev/null)
+root=$main
+[ -n "$main" ] && root=$(cd "$main" >/dev/null 2>&1 && pwd -P)
+
+if [ "$have_gh" -eq 1 ]; then
+  gh_note="gh: on (squash merges detected)"
+else
+  gh_note="gh: off (squash merges NOT detected)"
+fi
+printf 'base %s%s%s   %s\n\n' "$c_ok" "$base" "$c_off" "$gh_note"
+
+removed=0 failed=0 prunable=0
+for i in "${!wt_path[@]}"; do
+  path=${wt_path[$i]} branch=${wt_branch[$i]} flags=${wt_flags[$i]}
+  rel=${path#"$root"/}
+  [ "$path" = "$main" ] && continue
+  case "$flags" in *bare*) continue ;; esac
+  if [ "$path" = "$current" ]; then
+    report "$c_dim" skip "$rel" "current worktree"
+    continue
+  fi
+  case "$flags" in
+    *prunable*)
+      prunable=$((prunable + 1))
+      report "$c_dim" skip "$rel" "gone from disk (will be pruned)"
+      continue
+      ;;
+    *locked*)
+      report "$c_dim" skip "$rel" "locked"
+      continue
+      ;;
+  esac
+  if [ -z "$branch" ]; then
+    report "$c_dim" skip "$rel" "detached HEAD"
+    continue
+  fi
+  if [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
+    report "$c_dim" skip "$rel" "uncommitted changes"
+    continue
+  fi
+
+  if git merge-base --is-ancestor "refs/heads/$branch" "$base" 2>/dev/null; then
+    why="merged into ${base#origin/}"
+  else
+    pr=$(merged_pr "$branch")
+    if [ -n "$pr" ]; then
+      why="PR #$pr merged"
+    else
+      report "$c_dim" skip "$rel" "not merged"
+      continue
+    fi
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    report "$c_warn" 'would remove' "$rel" "($why)"
+    removed=$((removed + 1))
+    continue
+  fi
+
+  # The branch is deleted after the worktree because a checked-out branch cannot
+  # be deleted. `git branch -d` measures merge status against HEAD or the
+  # branch's upstream, never against $base, so it can refuse a branch we have
+  # just established is contained in $base — the -D fallback settles that.
+  if git worktree remove "$path" &&
+    { git branch -d "$branch" >/dev/null 2>&1 || git branch -D "$branch" >/dev/null; }; then
+    report "$c_ok" removed "$rel" "($why)"
+    removed=$((removed + 1))
+  else
+    report "" failed "$rel" "($why)"
+    failed=$((failed + 1))
+  fi
+done
+
+if [ "$prunable" -gt 0 ] && [ "$dry_run" -eq 0 ]; then
+  git worktree prune
+  report "$c_ok" pruned "$prunable stale entries" ""
+fi
+
+printf '\n'
+if [ "$dry_run" -eq 1 ]; then
+  if [ "$((removed + prunable))" -gt 0 ]; then
+    printf '%d to remove, %d stale. Re-run with %s-y%s to apply.\n' \
+      "$removed" "$prunable" "$c_ok" "$c_off"
+  else
+    printf 'nothing to clean.\n'
+  fi
+else
+  printf '%d removed, %d failed.\n' "$removed" "$failed"
+fi
+[ "$failed" -eq 0 ]
